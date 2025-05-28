@@ -92,7 +92,7 @@ def get_duration(ffprobe_path: Path, media_path: Path) -> float:
     Returns 0 if the media file is invalid or ffprobe fails.
     """
     args = [ffprobe_path]
-    args += "-v warning -show_entries format=duration -of default=noprint_wrappers=1:nokey=1".split()
+    args += "-v quiet -show_entries format=duration -of default=noprint_wrappers=1:nokey=1".split()
     args.append(media_path)
     #print(*args)
     return float(subprocess.run(args, capture_output=True, text=True).stdout)
@@ -130,7 +130,7 @@ def segment(ffmpeg_path: Path, media_path: Path, output_dir: Path, segment_time,
     return list(map(Path, re.findall(r"^\[segment @ \w*?\] Opening '(.+?)' for writing$", process.stderr, flags=re.MULTILINE))), audio_path
 
 
-def encode(ffmpeg_path: Path, affinity: tuple[int, int], media_path: str | Path, output_path: Path | str | None = None, params: str | None = None) -> subprocess.Popen:
+def encode(ffmpeg_path: Path, affinity: tuple[int, int], media_path: str | Path, output_path: Path | str | None = None, params: str | None = None) -> subprocess.Popen[str]:
     """
     Encodes the media file using SVT-AV1 encoder with specified parameters.
     Returns a subprocess.Popen object for the encoding process.
@@ -155,13 +155,13 @@ def encode(ffmpeg_path: Path, affinity: tuple[int, int], media_path: str | Path,
         ))
 
     args = [ffmpeg_path]
-    args += "-v warning -stats -stats_period 1 -y -i".split()
+    args += "-v warning -nostats -progress pipe:1 -stats_period 1 -y -i".split()
     args.append(media_path)
     # log2 is almost like lp level in https://gitlab.com/AOMediaCodec/SVT-AV1/-/blob/master/Source/Lib/Globals/enc_handle.c
     args += f"-an -pix_fmt yuv420p10le -c:v libsvtav1 -svtav1-params {params}:lp={log2(affinity[1] - affinity[0] + 2):.0f}".split()
     args.append(output_path)
     #print(*args)
-    process = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, universal_newlines=True, creationflags=subprocess.DETACHED_PROCESS)
+    process = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, universal_newlines=True)
     psutil.Process(process.pid).cpu_affinity(list(range(affinity[0], affinity[1] + 1)))
     return process
 
@@ -179,21 +179,19 @@ def process_encoding_queue(ffmpeg_path: Path, ffprobe_path: Path, affinity: tupl
             break
         
         process = encode(ffmpeg_path, affinity, media_path, output_path, params)
-        with tqdm.tqdm(total=segment_duration, desc=f"[T{affinity[0]:<2}-{affinity[1]:>2}] {media_path.name}", unit="sec(s)", leave=False) as pbar:
+        with tqdm.tqdm(total=int(1_000_000 * segment_duration), desc=f"[T{affinity[0]:<2}-{affinity[1]:>2}] {media_path.name}", unit="µsec(s)", leave=False) as pbar:
             # read the stream until eof is reached
-            for line in iter(process.stderr.readline, ''):
-                result = re.search(r"fps=\s*(\d+(?:\.\d+)?)", line)
-                if result:
-                    pbar.set_postfix(fps=result.groups()[0])
-                
-                result = re.search(r"time=\s*([^\s]+)", line)
-                if result:
-                    pbar.update(parse_sexagesimal_time(result.groups()[0]) - pbar.n)
-                    
+            for line in iter(process.stdout.readline, ''):
                 if stop_event.is_set():
                     process.terminate()
                     break
-                
+
+                match line.rstrip().split("=", 1):
+                    case ("fps", fps):
+                        pbar.set_postfix(fps=fps)
+                    case ("out_time_us", time) if time != "N/A":
+                        pbar.update(int(time) - pbar.n)
+
         try:
             process.wait(15)
         except subprocess.TimeoutExpired:
@@ -205,7 +203,7 @@ def process_encoding_queue(ffmpeg_path: Path, ffprobe_path: Path, affinity: tupl
         media_path.unlink(missing_ok=True)
         
         
-def encode_audio(ffmpeg_path: Path, media_path: str | Path, audio_codec: str, audio_bitrate: str | None = None, output_path: Path | str | None = None) -> subprocess.Popen:
+def encode_audio(ffmpeg_path: Path, media_path: str | Path, audio_codec: str, audio_bitrate: str | None = None, output_path: Path | str | None = None) -> subprocess.Popen[str]:
     """
     Encodes the audio of the media file using the specified audio codec and bitrate.
     Returns a subprocess.Popen object for the encoding process.
@@ -222,7 +220,7 @@ def encode_audio(ffmpeg_path: Path, media_path: str | Path, audio_codec: str, au
         output_path = Path(output_path)
 
     args = [ffmpeg_path]
-    args += "-v warning -stats -y -i".split()
+    args += "-v warning -nostats -progress pipe:1 -stats_period 1 -y -i".split()
     args.append(media_path)
     args += "-vn -c:a".split()
     args.append(audio_codec)
@@ -232,7 +230,7 @@ def encode_audio(ffmpeg_path: Path, media_path: str | Path, audio_codec: str, au
         
     args.append(output_path)
     #print(*args)
-    process = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, universal_newlines=True, creationflags=subprocess.DETACHED_PROCESS)
+    process = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, universal_newlines=True, creationflags=subprocess.DETACHED_PROCESS)
     return process
 
 
@@ -257,13 +255,13 @@ def concatenate(ffmpeg_path: Path, segment_paths: list[Path], audio_path: Path, 
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="This script tries to parallel encode a video based on scene changes")
+    parser = argparse.ArgumentParser(description="Segments a video file and encode them in parallel with SVT-AV1 encoders.")
     parser.add_argument("--ffmpeg_path", default="ffmpeg", help="path to ffmpeg executable (default expect ffmpeg to be in PATH)")
     parser.add_argument("--ffprobe_path", default="ffprobe", help="path to ffprobe executable (default expect ffprobe to be in PATH)")
     parser.add_argument("-d", "--temp_dir", type=Path, help="path to directory to store video fragments (default same directory as filename)")
     parser.add_argument("-ss", "--start_time", default=None, help="start transcoding at specified time (same as ffmpeg)")
     parser.add_argument("-to", "--end_time", default=None, help="stop transcoding after specified time is reached (same as ffmpeg)")
-    parser.add_argument("-t", "--segment_time", default="5", help="segment duration in seconds (default = 5")
+    parser.add_argument("-t", "--segment_time", default="5", help="segment duration in seconds (default = 5)")
     parser.add_argument("-p", "--params", help="parameters for SVT-AV1 encoder (lp level is automatically set based on CPU affinities, default is 'preset=6:tune=0:keyint:10s:crf=45')")
     parser.add_argument("-c", "--audio_codec", help="re-encode audio with codec (default is to copy audio from source file)")
     parser.add_argument("-b", "--audio_bitrate", help="audio bitrate (default is audio encoder default bitrate)")
@@ -308,11 +306,11 @@ if __name__ == "__main__":
         if options.audio_codec:
             encoded_audio_path = audio_path.with_name("encoded-" + audio_path.name)
             audio_process = encode_audio(options.ffmpeg_path, audio_path, options.audio_codec, options.audio_bitrate, encoded_audio_path)
-            with tqdm.tqdm(total=get_duration(options.ffprobe_path, audio_path), desc=audio_path.name, unit="sec(s)", leave=False) as audio_pbar:
-                for line in iter(audio_process.stderr.readline, ''):
-                    result = re.search(r"time=\s*([^\s]+)", line)
-                    if result:
-                        audio_pbar.update(parse_sexagesimal_time(result.groups()[0]) - audio_pbar.n)
+            with tqdm.tqdm(total=int(1_000_000 * get_duration(options.ffprobe_path, audio_path)), desc=audio_path.name, unit="µsec(s)", leave=False) as audio_pbar:
+                for line in iter(audio_process.stdout.readline, ''):
+                    match line.rstrip().split("=", 1):
+                        case ("out_time_us", time) if time != "N/A":
+                            audio_pbar.update(int(time) - audio_pbar.n)
                 
             try:
                 audio_process.wait(15)
