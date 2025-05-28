@@ -265,6 +265,7 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--params", help="parameters for SVT-AV1 encoder (lp level is automatically set based on CPU affinities, default is 'preset=6:tune=0:keyint:10s:crf=45')")
     parser.add_argument("-c", "--audio_codec", help="re-encode audio with codec (default is to copy audio from source file)")
     parser.add_argument("-b", "--audio_bitrate", help="audio bitrate (default is audio encoder default bitrate)")
+    parser.add_argument("-o", "--output", type=Path, help="output file path (default is the same as input file with '-concat' suffix and '.mkv' extension)")
     parser.add_argument("filename", type=Path, help="the media file to encode")
     parser.add_argument("affinities", help="comma separated cpu index or range of cpu indexes or cores-per-group@start[*repeat], define parallelism (example: 0,1,2-3,4-7,2@8,2@10*3)")
     options = parser.parse_args()
@@ -275,11 +276,16 @@ if __name__ == "__main__":
     affinities = parse_affinity_specs(options.affinities)
     print(f"concurrency is set to {len(affinities)}")
     if not options.temp_dir:
-        temp_dir = options.filename.with_name(options.filename.name + "-temp")
+        temp_dir = options.filename.with_name(options.filename.stem + "-tmp")
     else:
         temp_dir = Path(options.temp_dir)
 
     temp_dir.mkdir(parents=True, exist_ok=True)
+    if not options.output:
+        output_path = options.filename.with_name(options.filename.stem + "-concat.mkv")
+    else:
+        output_path = options.output
+
     segment_paths, audio_path = segment(options.ffmpeg_path, options.filename, temp_dir, options.segment_time, options.start_time, options.end_time)
     if not segment_paths:
         print("fail to segment file")
@@ -336,7 +342,7 @@ if __name__ == "__main__":
             exit(-1)
 
     print("all segments encoded, merging...")
-    if not concatenate(options.ffmpeg_path, encoded_segment_paths, encoded_audio_path, options.filename.with_name(options.filename.stem + "-concat.mkv")):
+    if not concatenate(options.ffmpeg_path, encoded_segment_paths, encoded_audio_path, output_path):
         print("fail to merge segments")
         cleanup(temp_dir)
         exit(-1)
