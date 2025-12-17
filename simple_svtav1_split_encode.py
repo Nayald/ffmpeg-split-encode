@@ -10,12 +10,13 @@ import re
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from queue import Empty, Queue
+from queue import Queue
 from threading import Event, Thread
 
+import psutil
 import tqdm
 
-from encode_handlers import ProcessHandler, map_affinities_to_handlers
+from encode_handlers import map_affinities_to_handlers
 
 """
 This script segments a video file into smaller parts based on scene changes, encodes each segment in parallel using the SVT-AV1 encoder, and then merges the encoded segments back into a single video file.
@@ -30,7 +31,7 @@ def cleanup(path: Path) -> None:
     Cleans up the temporary directory by removing all files and the directory itself.
     """
     for child in path.iterdir():
-        child.unlink()
+        child.unlink(missing_ok=True)
 
     path.rmdir()
 
@@ -66,30 +67,21 @@ def get_duration(ffprobe_path: Path, media_path: Path) -> float:
     return float(subprocess.run(args, capture_output=True, text=True).stdout)
 
 
-def segment(ffmpeg_path: Path, media_path: Path, output_dir: Path, segment_time, start=None, end=None) -> tuple[list[Path], Path]:
+def segment(ffmpeg_path: Path, media_path: Path, output_dir: Path, segment_time: float | str, start: str | None = None, end: str | None = None) -> tuple[list[Path], Path]:
     """
     Segments the media file into smaller parts using ffmpeg.
     Returns a list of segment file paths and the path to the audio file.
     If the segmentation fails, returns an empty list and an empty Path.
     """
-    args = [ffmpeg_path]
-    args += ["-hide_banner", "-nostats", "-y"]
+    args = [ffmpeg_path, "-hide_banner", "-nostats", "-y"]
     if start:
-        args.append("-ss")
-        args.append(start)
+        args += ["-ss", start]
 
     if end:
-        args.append("-to")
-        args.append(end)
+        args += ["-to", end]
 
-    args.append("-i")
-    args.append(media_path)
-    args += ["-an", "-c", "copy", "-f", "segment", "-reset_timestamps", "1", "-segment_time"]
-    args.append(segment_time)
-    args.append(output_dir / "segment-%04d.mkv")
-    args += ["-vn", "-c:a", "copy"]
     audio_path = output_dir / "audio.mkv"
-    args.append(audio_path)
+    args += ["-i", media_path, "-an", "-c", "copy", "-f", "segment", "-reset_timestamps", "1", "-segment_time", segment_time, output_dir / "segment-%04d.mkv", "-vn", "-c:a", "copy", audio_path]
     # print(*args)
     process = subprocess.run(args, capture_output=True, text=True)
     if process.returncode != 0:
@@ -125,16 +117,7 @@ def encode_audio(ffmpeg_path: Path, media_path: str | Path, audio_codec: str, au
 
     args.append(output_path)
     # print(*args)
-    process = subprocess.Popen(
-        args,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        text=True,
-        universal_newlines=True,
-        creationflags=subprocess.DETACHED_PROCESS,
-    )
-    return process
+    return subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, universal_newlines=True, creationflags=subprocess.DETACHED_PROCESS)
 
 
 def concatenate(ffmpeg_path: Path, segment_paths: list[Path], audio_path: Path, output_path: Path) -> bool:
@@ -171,7 +154,14 @@ if __name__ == "__main__":
     parser.add_argument("-b", "--audio_bitrate", help="audio bitrate (default is audio encoder default bitrate)")
     parser.add_argument("-o", "--output", type=Path, help="output file path (default is the same as input file with '-concat' suffix and '.mkv' extension)")
     parser.add_argument("filename", type=Path, help="the media file to encode")
-    parser.add_argument("affinities", nargs="+", help="comma separated cpu index or range of cpu indexes or cores-per-group@start[*repeat], define parallelism (example: 0,1,2-3,4-7,2@8,2@10*3)")
+    parser.add_argument(
+        "affinities",
+        nargs="+",
+        help=(
+            "comma separated cpu index or range of cpu indexes or cores-per-group@start[*repeat], define parallelism (example: 0,1,2-3,4-7,2@8,2@10*3)"
+            ", can also specify remote host by prefixing with hostname= (example: 192.168.1.2=0,1-2,1@3*2), can be repeated to define multiple hosts"
+        ),
+    )
     options = parser.parse_args()
 
     if not options.filename.exists():
@@ -193,12 +183,12 @@ if __name__ == "__main__":
         exit(-1)
 
     print(f"got {len(segment_paths)} segments, sorting by duration...")
-    with ThreadPoolExecutor(max_workers=8) as executor:
+    with ThreadPoolExecutor(max_workers=psutil.cpu_count()) as executor:
         segment_durations = list(tqdm.tqdm(executor.map(lambda x: get_duration(options.ffprobe_path, x), segment_paths), total=len(segment_paths), desc="getting segment durations", unit="segment(s)"))
 
     encoded_segment_paths = [segment_path.with_name("encoded-" + segment_path.name) for segment_path in segment_paths]
     encoding_queue = Queue()
-    for segment_path, segment_duration, encoded_segment_path in sorted(zip(segment_paths, segment_durations, encoded_segment_paths), key=lambda x: x[1], reverse=True):
+    for segment_path, segment_duration, encoded_segment_path in sorted(zip(segment_paths, segment_durations, encoded_segment_paths, strict=True), key=lambda x: x[1], reverse=True):
         encoding_queue.put((segment_path, segment_duration, encoded_segment_path, options.params, 3))
 
     print("encoding segments...")
@@ -213,6 +203,7 @@ if __name__ == "__main__":
             encoded_audio_path = audio_path.with_name("encoded-" + audio_path.name)
             audio_process = encode_audio(options.ffmpeg_path, audio_path, options.audio_codec, options.audio_bitrate, encoded_audio_path)
             with tqdm.tqdm(total=int(get_duration(options.ffprobe_path, audio_path) * 1000), desc=audio_path.name, unit="ms", leave=False) as audio_pbar:
+                assert audio_process.stdout is not None
                 for line in iter(audio_process.stdout.readline, ""):
                     match line.rstrip().split("=", 1):
                         case ("out_time_us", time) if time != "N/A":

@@ -19,7 +19,7 @@ python simple-svtav1-split-encode.py myvideo.mp4 "2@0*8"
 | Argument   | Description |
 |:-----------|:------------|
 |`filename`    | the media file to encode |
-|`affinities`  | comma separated cpu index or range of cpu indexes or cores-per-group@start[\*repeat], define parallelism (example: 0,1,2-3,4-7,2@8,2@10\*3) |
+|`affinities`  | comma separated cpu index or range of cpu indexes or cores-per-group@start[\*repeat], define parallelism (example: 0,1,2-3,4-7,2@8,2@10\*3), can also specify remote host by prefixing with hostname= (example: 192.168.1.2=0,1-2,1@3*2), can be repeated to define multiple hosts |
 
 > _Note: for example `2@10*3` means 3 groups with 2 cores each, starting at core 10. It is equivalent to `10-11,12-13,14-15`._
 

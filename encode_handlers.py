@@ -67,6 +67,7 @@ class HostProcessHandler(ProcessHandler):
             p = self.create_process(media_path, output_path, params)
             with tqdm.tqdm(total=int(segment_duration * 1000), desc=f"[T{self.affinity[0]:<2}-{self.affinity[1]:>2}] {media_path.name}", unit="ms", leave=False) as pbar:
                 # read the stream until eof is reached
+                assert p.stdout is not None
                 for line in iter(p.stdout.readline, ""):
                     if self.stop_event.is_set():
                         p.terminate()
@@ -89,11 +90,12 @@ class HostProcessHandler(ProcessHandler):
                 encoding_queue.task_done()
                 media_path.unlink(missing_ok=True)
             else:
+                global_pbar.write(f"[{self}] Encoding failed for {media_path} with return code {p.returncode}. Retries left: {retries - 1}")
                 encoding_queue.put((media_path, segment_duration, output_path, params, retries - 1))
                 encoding_queue.task_done()
 
-    def __resp__(self) -> str:
-        return f"HostProcessHandler(ffmpeg_path={self.ffmpeg_path}, affinity={self.affinity})"
+    def __repr__(self) -> str:
+        return f"HostProcessHandler(affinity={self.affinity})"
 
 
 class RemoteProcessHandler(ProcessHandler):
@@ -101,9 +103,6 @@ class RemoteProcessHandler(ProcessHandler):
         super().__init__(affinity=affinity, stop_event=stop_event)
         self.host = host
         self.ssh_key = ssh_key
-        self.send_data_thread: Thread | None = None
-        self.receive_data_thread: Thread | None = None
-        self.receive_stats_thread: Thread | None = None
 
     def send_data(self, stdin: BufferedWriter, media_path: Path | str) -> None:
         with open(media_path, "rb") as f:
@@ -113,7 +112,7 @@ class RemoteProcessHandler(ProcessHandler):
 
                 stdin.close()
             except Exception as e:
-                print(f"[{self.host}:T{self.affinity[0]:<2}-{self.affinity[1]:>2}], stdin: {e}")
+                tqdm.tqdm.write(f"[{self}], stdin: {e}")
 
     def receive_data(self, stdout: BufferedReader, output_path: Path | str) -> None:
         with open(output_path, "wb") as f:
@@ -122,7 +121,7 @@ class RemoteProcessHandler(ProcessHandler):
                     f.write(d)
 
             except Exception as e:
-                print(f"[{self.host}:T{self.affinity[0]:<2}-{self.affinity[1]:>2}] stdout: {e}")
+                tqdm.tqdm.write(f"[{self}] stdout: {e}")
 
     def receive_stats(self, stderr: BufferedReader, pbar: tqdm.tqdm, global_pbar: tqdm.tqdm) -> None:
         with TextIOWrapper(stderr, encoding="utf-8", errors="replace") as stream:
@@ -134,7 +133,7 @@ class RemoteProcessHandler(ProcessHandler):
                         case ("out_time_us", time) if time != "N/A":
                             pbar.update(int(time) // 1000 - pbar.n)
             except Exception as e:
-                tqdm.tqdm.write(f"[{self.host}:T{self.affinity[0]:<2}-{self.affinity[1]:>2}], stderr: {e}")
+                tqdm.tqdm.write(f"[{self}], stderr: {e}")
 
     def create_process(self, params: str) -> subprocess.Popen[bytes]:
         args = ["ssh"]
@@ -175,20 +174,17 @@ class RemoteProcessHandler(ProcessHandler):
                 params = "preset=6:tune=0:keyint=10s:crf=45"
 
             p = self.create_process(params)
-            self.send_data_thread = Thread(target=self.send_data, args=(p.stdin, media_path))
-            self.send_data_thread.start()
-            self.receive_data_thread = Thread(target=self.receive_data, args=(p.stdout, output_path))
-            self.receive_data_thread.start()
+            send_data_thread = Thread(target=self.send_data, args=(p.stdin, media_path))
+            send_data_thread.start()
+            receive_data_thread = Thread(target=self.receive_data, args=(p.stdout, output_path))
+            receive_data_thread.start()
             pbar = tqdm.tqdm(total=int(segment_duration * 1000), desc=f"[{self.host}:T{self.affinity[0]:<2}-{self.affinity[1]:>2}] {media_path.name}", unit="ms", leave=False)
-            self.receive_stats_thread = Thread(target=self.receive_stats, args=(p.stderr, pbar, global_pbar))
-            self.receive_stats_thread.start()
+            receive_stats_thread = Thread(target=self.receive_stats, args=(p.stderr, pbar, global_pbar))
+            receive_stats_thread.start()
 
-            self.send_data_thread.join()
-            self.send_data_thread = None
-            self.receive_data_thread.join()
-            self.receive_data_thread = None
-            self.receive_stats_thread.join()
-            self.receive_stats_thread = None
+            send_data_thread.join()
+            receive_data_thread.join()
+            receive_stats_thread.join()
 
             try:
                 p.wait(15) if not self.stop_event.is_set() else p.terminate()
@@ -201,17 +197,11 @@ class RemoteProcessHandler(ProcessHandler):
                 encoding_queue.task_done()
                 # media_path.unlink(missing_ok=True)
             else:
+                global_pbar.write(f"[{self}] Encoding failed for {media_path} with return code {p.returncode}. Retries left: {retries - 1}")
                 encoding_queue.put((media_path, segment_duration, output_path, params, retries - 1))
                 encoding_queue.task_done()
 
-        if self.send_data_thread:
-            self.send_data_thread.join()
-        if self.receive_data_thread:
-            self.receive_data_thread.join()
-        if self.receive_stats_thread:
-            self.receive_stats_thread.join()
-
-    def __resp__(self) -> str:
+    def __repr__(self) -> str:
         return f"RemoteProcessHandler(host={self.host}, affinity={self.affinity})"
 
 
@@ -257,6 +247,11 @@ def map_affinities_to_handlers(affinities: list[str], ffmpeg_path: Path, ssh_key
     """
     Maps a list of CPU affinities to corresponding ProcessHandler instances.
     If host is specified, RemoteProcessHandler is used; otherwise, HostProcessHandler is used.
+    Args:
+        affinities (list[str]): List of affinity specifications, e.g., ["0-3", "remotehost=4-7"].
+        ffmpeg_path (Path): Path to the ffmpeg executable for local processing.
+        ssh_key (Path | str | None): Optional SSH key path for remote processing.
+        stop_event (Event | None): Optional threading event to signal stopping.
     """
     handlers = []
     for affinity in affinities:
@@ -265,5 +260,5 @@ def map_affinities_to_handlers(affinities: list[str], ffmpeg_path: Path, ssh_key
             RemoteProcessHandler(affinity[:pos], a, ssh_key, stop_event) if pos != -1 else HostProcessHandler(ffmpeg_path, a, stop_event) for a in parse_affinity_specification(affinity[pos + 1 :])
         )
 
-    handlers.sort(key=lambda h: (h.affinity[1] - h.affinity[0]) << isinstance(h, HostProcessHandler))  # favor HostProcessHandler
+    handlers.sort(key=lambda h: (h.affinity[1] - h.affinity[0]) << isinstance(h, HostProcessHandler), reverse=True)  # small favor for local handlers
     return handlers
