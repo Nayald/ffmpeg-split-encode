@@ -6,14 +6,11 @@
 # ///
 
 import argparse
-import re
 import subprocess
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from queue import Queue
 from threading import Event, Thread
 
-import psutil
 import tqdm
 
 from encode_handlers import map_affinities_to_handlers
@@ -60,20 +57,18 @@ def get_duration(ffprobe_path: Path, media_path: Path) -> float:
     Uses ffprobe to get the duration of the media file in seconds.
     Returns 0 if the media file is invalid or ffprobe fails.
     """
-    args = [ffprobe_path]
-    args += ["-v", "quiet", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1"]
-    args.append(media_path)
+    args = [ffprobe_path, "-v", "quiet", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", media_path]
     # print(*args)
     return float(subprocess.run(args, capture_output=True, text=True).stdout)
 
 
-def segment(ffmpeg_path: Path, media_path: Path, output_dir: Path, segment_time: float | str, start: str | None = None, end: str | None = None) -> tuple[list[Path], Path]:
+def segment(ffmpeg_path: Path, media_path: Path, output_dir: Path, segment_time: float | str, start: str | None = None, end: str | None = None) -> tuple[list[tuple[Path, float]], Path]:
     """
     Segments the media file into smaller parts using ffmpeg.
     Returns a list of segment file paths and the path to the audio file.
     If the segmentation fails, returns an empty list and an empty Path.
     """
-    args = [ffmpeg_path, "-hide_banner", "-nostats", "-y"]
+    args = [ffmpeg_path, "-v", "warning", "-nostats", "-y"]
     if start:
         args += ["-ss", start]
 
@@ -81,13 +76,15 @@ def segment(ffmpeg_path: Path, media_path: Path, output_dir: Path, segment_time:
         args += ["-to", end]
 
     audio_path = output_dir / "audio.mkv"
-    args += ["-i", media_path, "-an", "-c", "copy", "-f", "segment", "-reset_timestamps", "1", "-segment_time", segment_time, output_dir / "segment-%04d.mkv", "-vn", "-c:a", "copy", audio_path]
+    args += ["-i", media_path]
+    args += ["-an", "-c", "copy", "-f", "segment", "-reset_timestamps", "1", "-segment_time", segment_time, "-segment_list", "pipe:1", "-segment_list_type", "csv", output_dir / "segment-%04d.mkv"]
+    args += ["-vn", "-c:a", "copy", audio_path]
     # print(*args)
     process = subprocess.run(args, capture_output=True, text=True)
     if process.returncode != 0:
         return [], Path()
 
-    return list(map(Path, re.findall(r"^\[segment @ \w*?\] Opening '(.+?)' for writing$", process.stderr, flags=re.MULTILINE))), audio_path
+    return [(output_dir / p, float(e) - float(s)) for p, s, e in (x.split(",") for x in process.stdout.splitlines())], audio_path
 
 
 def encode_audio(ffmpeg_path: Path, media_path: str | Path, audio_codec: str, audio_bitrate: str | None = None, output_path: Path | str | None = None) -> subprocess.Popen[str]:
@@ -106,11 +103,7 @@ def encode_audio(ffmpeg_path: Path, media_path: str | Path, audio_codec: str, au
     if isinstance(output_path, str):
         output_path = Path(output_path)
 
-    args = [ffmpeg_path]
-    args += ["-v", "warning", "-nostats", "-progress", "pipe:1", "-stats_period", "1", "-y", "-i"]
-    args.append(media_path)
-    args += ["-vn", "-c:a"]
-    args.append(audio_codec)
+    args = [ffmpeg_path, "-v", "warning", "-nostats", "-progress", "pipe:1", "-stats_period", "1", "-y", "-i", media_path, "-vn", "-c:a", audio_codec]
     if audio_bitrate:
         args.append("-b:a")
         args.append(audio_bitrate)
@@ -129,13 +122,7 @@ def concatenate(ffmpeg_path: Path, segment_paths: list[Path], audio_path: Path, 
     with open(concat_file, mode="w") as f:
         f.writelines(f"file '{segment_path.absolute()}'\n" for segment_path in segment_paths)
 
-    args = [ffmpeg_path]
-    args += ["-v", "warning", "-stats", "-y", "-f", "concat", "-safe", "0", "-i"]
-    args.append(concat_file)
-    args.append("-i")
-    args.append(audio_path)
-    args += ["-map", "0:v", "-map", "1:a", "-c", "copy"]
-    args.append(output_path)
+    args = [ffmpeg_path, "-v", "warning", "-stats", "-y", "-f", "concat", "-safe", "0", "-i", concat_file, "-i", audio_path, "-map", "0:v", "-map", "1:a", "-c", "copy", output_path]
     # print(*args)
     return subprocess.run(args).returncode == 0
 
@@ -176,23 +163,19 @@ if __name__ == "__main__":
     temp_dir.mkdir(parents=True, exist_ok=True)
     output_path = options.filename.with_name(options.filename.stem + "-concat.mkv") if not options.output else options.output
 
-    segment_paths, audio_path = segment(options.ffmpeg_path, options.filename, temp_dir, options.segment_time, options.start_time, options.end_time)
-    if not segment_paths:
+    segment_infos, audio_path = segment(options.ffmpeg_path, options.filename, temp_dir, options.segment_time, options.start_time, options.end_time)
+    if not segment_infos:
         print("fail to segment file")
         cleanup(temp_dir)
         exit(-1)
 
-    print(f"got {len(segment_paths)} segments, sorting by duration...")
-    with ThreadPoolExecutor(max_workers=psutil.cpu_count()) as executor:
-        segment_durations = list(tqdm.tqdm(executor.map(lambda x: get_duration(options.ffprobe_path, x), segment_paths), total=len(segment_paths), desc="getting segment durations", unit="segment(s)"))
-
-    encoded_segment_paths = [segment_path.with_name("encoded-" + segment_path.name) for segment_path in segment_paths]
+    encoded_segment_paths = [segment_info[0].with_name("encoded-" + segment_info[0].name) for segment_info in segment_infos]
     encoding_queue = Queue()
-    for segment_path, segment_duration, encoded_segment_path in sorted(zip(segment_paths, segment_durations, encoded_segment_paths, strict=True), key=lambda x: x[1], reverse=True):
+    for segment_path, segment_duration, encoded_segment_path in sorted(zip(*zip(*segment_infos, strict=True), encoded_segment_paths, strict=True), key=lambda x: x[1], reverse=True):
         encoding_queue.put((segment_path, segment_duration, encoded_segment_path, options.params, 3))
 
     print("encoding segments...")
-    with tqdm.tqdm(total=len(segment_paths), desc="segments done", unit="segment(s)", leave=True) as global_pbar:
+    with tqdm.tqdm(total=len(segment_infos), desc="segments done", unit="segment(s)", leave=True) as global_pbar:
         encode_threads = []
         for process_handler in process_handlers:
             t = Thread(target=process_handler.run, args=(global_pbar, encoding_queue))

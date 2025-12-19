@@ -142,8 +142,8 @@ class RemoteProcessHandler(ProcessHandler):
 
         args.append(self.host)
         args.append(
-            f"taskset -c {self.affinity[0]}-{self.affinity[1]} ffmpeg -v warning -nostats -progress pipe:2 -stats_period 1 -y -i - \
-                -an -pix_fmt yuv420p10le -c:v libsvtav1 -svtav1-params {params}:lp={log2(self.affinity[1] - self.affinity[0] + 2):.0f} -f matroska -"
+            f"taskset -c {self.affinity[0]}-{self.affinity[1]} ffmpeg -v warning -nostats -progress pipe:2 -stats_period 1 -y -i - "
+            f"-an -pix_fmt yuv420p10le -c:v libsvtav1 -svtav1-params {params}:lp={log2(self.affinity[1] - self.affinity[0] + 2):.0f} -f matroska -"
         )
         return subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
